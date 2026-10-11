@@ -1,0 +1,31 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "RNNNImdFeeHook",
+    "constructorArgs": [
+      "$poolManager",
+      "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+      "0x45c89d0cf0b8a05218506236fcfcb18da1d3ebe4"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "RNNNToken",
+    "name": "RNNN",
+    "symbol": "RNNN",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Implementation limitation: payment is deferred when the PoolManager holds less IMD than the current fee; immediate transfer on every swap is therefore not guaranteed. The hook mints an ERC-6909 claim, redeemable in IMD to the immutable recipient by anyone calling collectPending() or by a later fee-bearing swap with sufficient IMD. RNNNToken is the rnnn.io community token for the RNNN/IMD Uniswap v4 pool on Robinhood Chain (4663); its constructor takes no arguments. RNNNImdFeeHook constructor order is poolManager_, imd_, feeRecipient_. It has no owner, pause, administrative setters, token-minting function or upgrade mechanism. The hook fee is 100 basis points, rounded down to whole IMD minor units, separate from the pool's 12500 (1.25%) LP fee. When IMD is the specified currency (exact-input buys or exact-output sells), beforeSwap declares a fee of floor(abs(amountSpecified)/100); otherwise afterSwap declares floor(abs(the executed IMD pool delta)/100). The specified-currency calculation uses the requested amount and does not adjust for partial fills. Fees are taken only in IMD and paid to 0x45c89d0cf0b8a05218506236fcfcb18da1d3ebe4; there is no conversion to ETH or any other token. Enabled callbacks and unlockCallback accept only the configured PoolManager. beforeInitialize requires an IMD side and accepts any initializer, including the launch factory, with fee 12500 and tick spacing 60; it does not bind the hook exclusively to RNNN or restrict the initializer, LP fee or spacing. The declared permissions correspond to address bits 0x20cc. pool.initialPrice records the required reference value; the deployer derives the actual opening price under the separately versioned launch policy. Existing Foundry tests cover exact-input and exact-output buys and sells, the fixed IMD recipient, absence of privileged functions, permission bits, initialization, fee rounding, conservation and deferred collection."
+}
