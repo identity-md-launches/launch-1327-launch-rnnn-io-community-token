@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -14,6 +15,7 @@ import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
 
@@ -21,6 +23,7 @@ import {HookFlags} from "../src/HookFlags.sol";
 import {RNNNImdFeeHook} from "../src/RNNNImdFeeHook.sol";
 import {RNNNToken} from "../src/RNNNToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {ActualDeltaRouter} from "./mocks/ActualDeltaRouter.sol";
 
 /// @notice Shared scaffolding: a PoolManager, the launch token, a mock IMD, the hook mined to its
 /// flags, the launch pool (LP fee 12500, tick spacing 60, price 1:1) and v4-core's test routers.
@@ -135,6 +138,30 @@ abstract contract RNNNImdFeeHookTestBase is Test {
         return swapRouter.swap(key, params, PoolSwapTest.TestSettings(false, false), "");
     }
 
+    /// @dev Swap parameters whose price limit sits one tick spacing from the pool's current price, so
+    /// the pool stops filling there: the slippage-protected shape of a swap, and the shape a
+    /// front-runner forces when they push the price to a victim's limit.
+    function limitedParams(bool zeroForOne, int256 amountSpecified) internal view returns (SwapParams memory) {
+        (, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        return SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: amountSpecified,
+            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(zeroForOne ? tick - TICK_SPACING : tick + TICK_SPACING)
+        });
+    }
+
+    /// @dev How a revert inside `afterSwap` reaches the caller of `PoolManager.unlock`: wrapped by
+    /// v4-core with the hook address, the callback selector and `HookCallFailed`.
+    function wrappedAfterSwapRevert(bytes4 reason) internal view returns (bytes memory) {
+        return abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            address(hook),
+            IHooks.afterSwap.selector,
+            abi.encodeWithSelector(reason),
+            abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+        );
+    }
+
     struct Balances {
         uint256 swapperImd;
         uint256 swapperRnnn;
@@ -217,15 +244,21 @@ contract RNNNImdFeeHookTest is RNNNImdFeeHookTestBase {
     function test_buyExactInput_sendsOnePercentOfImdInToRecipient() public {
         Balances memory before = snapshot();
         uint256 amountIn = 1_000 ether;
+        // The swapper's 1,000 IMD is the pool's leg plus 1% of it: the pool trades 1000 * 100/101 and
+        // the fee is 1000 / 101 IMD, which is exactly 1% (floor) of the pool's IMD side.
+        uint256 expectedFee = amountIn / 101;
 
         vm.expectEmit(address(hook));
-        emit RNNNImdFeeHook.FeePaid(10 ether);
+        emit RNNNImdFeeHook.FeePaid(expectedFee);
         buy(-int256(amountIn));
 
         Balances memory after_ = snapshot();
-        assertEq(after_.recipientImd - before.recipientImd, 10 ether, "recipient gets exactly 1% of the IMD side");
+        uint256 fee = after_.recipientImd - before.recipientImd;
+        uint256 pooled = after_.managerImd - before.managerImd;
+        assertEq(fee, expectedFee, "recipient gets 1/101 of the swapper's IMD");
+        assertEq(fee, pooled / 100, "which is exactly 1% of the IMD side the pool traded");
         assertEq(before.swapperImd - after_.swapperImd, amountIn, "swapper pays exactly what they specified");
-        assertEq(after_.managerImd - before.managerImd, amountIn - 10 ether, "the pool trades the other 99%");
+        assertEq(pooled, amountIn - fee, "the pool trades the rest");
         assertGt(after_.swapperRnnn, before.swapperRnnn, "swapper received RNNN");
         assertEq(after_.recipientRnnn, before.recipientRnnn, "no RNNN leaves for the recipient");
         assertEq(after_.hookImd, 0, "the hook keeps nothing");
@@ -273,16 +306,38 @@ contract RNNNImdFeeHookTest is RNNNImdFeeHookTestBase {
     function test_sellExactOutput_swapperGetsExactlyWhatTheyAskedAndRecipientOnePercent() public {
         Balances memory before = snapshot();
         uint256 wantImd = 1_000 ether;
+        // The swapper's 1,000 IMD is the pool's leg minus 1% of it: the pool pays out 1000 * 100/99
+        // and the fee is 1000 / 99 IMD, exactly 1% (floor) of the pool's IMD side.
+        uint256 expectedFee = wantImd / 99;
 
         vm.expectEmit(address(hook));
-        emit RNNNImdFeeHook.FeePaid(10 ether);
+        emit RNNNImdFeeHook.FeePaid(expectedFee);
         sell(int256(wantImd));
 
         Balances memory after_ = snapshot();
+        uint256 fee = after_.recipientImd - before.recipientImd;
+        uint256 pooledOut = before.managerImd - after_.managerImd;
         assertEq(after_.swapperImd - before.swapperImd, wantImd, "swapper receives exactly the IMD asked for");
-        assertEq(after_.recipientImd - before.recipientImd, 10 ether, "recipient gets exactly 1% of the IMD side");
-        assertEq(before.managerImd - after_.managerImd, wantImd + 10 ether, "the pool pays out both");
+        assertEq(fee, expectedFee, "recipient gets 1/99 of the swapper's IMD");
+        assertEq(fee, pooledOut / 100, "which is exactly 1% of the IMD side the pool paid out");
+        assertEq(pooledOut, wantImd + fee, "the pool pays out both");
         assertGt(before.swapperRnnn - after_.swapperRnnn, 0, "swapper paid RNNN");
+    }
+
+    /// @dev One base on every shape: the fee is 1% (floor) of the pool's IMD leg whether the swapper
+    /// specified IMD or RNNN, input or output. Finding 80701ca0 measured 1.0101%, 0.9901% and 1% here.
+    function test_feeBaseIsThePoolsImdSideOnEveryShape() public {
+        int256[4] memory amounts = [int256(-1_000 ether), int256(500 ether), int256(-1_000 ether), int256(1_000 ether)];
+        for (uint256 i = 0; i < 4; i++) {
+            Balances memory before = snapshot();
+            if (i < 2) buy(amounts[i]);
+            else sell(amounts[i]);
+            Balances memory after_ = snapshot();
+            uint256 fee = after_.recipientImd - before.recipientImd;
+            uint256 poolLeg = i < 2 ? after_.managerImd - before.managerImd : before.managerImd - after_.managerImd;
+            assertGt(fee, 0);
+            assertEq(fee, poolLeg / 100, "fee is 1% of the pool's IMD leg");
+        }
     }
 
     // ------------------------------------------------------------------ properties
@@ -295,9 +350,13 @@ contract RNNNImdFeeHookTest is RNNNImdFeeHookTestBase {
 
         Balances memory after_ = snapshot();
         uint256 fee = after_.recipientImd - before.recipientImd;
-        assertEq(fee, amountIn / 100, "fee is floor(1%)");
+        uint256 pooled = after_.managerImd - before.managerImd;
+        assertEq(fee, amountIn / 101, "fee is the full-fill declaration, 1/101 of the input");
+        // floor(X/101) and floor((X - floor(X/101))/100) differ by one wei when X mod 101 == 100.
+        assertApproxEqAbs(fee, pooled / 100, 1, "and 1% (floor) of the pool's IMD side, to a wei");
+        assertLe(fee, pooled / 100, "never more than 1% of the pool's side");
         assertEq(before.swapperImd - after_.swapperImd, amountIn, "swapper pays exactly amountIn");
-        assertEq(after_.managerImd - before.managerImd, amountIn - fee, "IMD is conserved");
+        assertEq(pooled, amountIn - fee, "IMD is conserved");
         assertEq(imd.balanceOf(address(hook)), 0);
     }
 
@@ -332,7 +391,7 @@ contract RNNNImdFeeHookTest is RNNNImdFeeHookTestBase {
         });
         swapRouter.swap(key, params, PoolSwapTest.TestSettings(false, false), abi.encode(address(0xBAD), uint256(1)));
         Balances memory after_ = snapshot();
-        assertEq(after_.recipientImd - before.recipientImd, 10 ether);
+        assertEq(after_.recipientImd - before.recipientImd, uint256(1_000 ether) / 101);
     }
 
     function test_feeKeepsFlowingAcrossManySwaps() public {
@@ -341,7 +400,8 @@ contract RNNNImdFeeHookTest is RNNNImdFeeHookTestBase {
             buy(-100 ether);
             sell(int256(100 ether));
         }
-        assertEq(imd.balanceOf(FEE_RECIPIENT) - start, 10 * 1 ether, "ten swaps, 1 IMD each");
+        uint256 perRound = uint256(100 ether) / 101 + uint256(100 ether) / 99;
+        assertEq(imd.balanceOf(FEE_RECIPIENT) - start, 5 * perRound, "ten swaps, each 1% of its pool leg");
         assertEq(hook.pendingFees(), 0);
         assertEq(imd.balanceOf(address(hook)), 0);
     }
@@ -495,47 +555,109 @@ contract RNNNImdFeeHookFreshPoolTest is RNNNImdFeeHookTestBase {
         assertEq(imd.balanceOf(address(manager)), 0, "the manager starts with no IMD");
     }
 
+    /// @dev The fee on a full-fill exact-input buy of 1,000 IMD: 1/101 of it, 1% of the pool's leg.
+    uint256 constant FEE_ON_1000_IN = uint256(1_000 ether) / 101;
+
     function test_firstBuyDefersTheFeeAsAClaimInsteadOfReverting() public {
         Balances memory before = snapshot();
 
         vm.expectEmit(address(hook));
-        emit RNNNImdFeeHook.FeeDeferred(10 ether);
+        emit RNNNImdFeeHook.FeeDeferred(FEE_ON_1000_IN);
         buy(-1_000 ether);
 
         Balances memory after_ = snapshot();
         assertEq(before.swapperImd - after_.swapperImd, 1_000 ether, "the swap went through at the full amount");
         assertGt(after_.swapperRnnn, before.swapperRnnn, "the swapper received RNNN");
         assertEq(after_.recipientImd, before.recipientImd, "nothing delivered yet: the manager held no IMD");
-        assertEq(hook.pendingFees(), 10 ether, "the fee is held as an ERC-6909 claim");
+        assertEq(hook.pendingFees(), FEE_ON_1000_IN, "the fee is held as an ERC-6909 claim");
         assertEq(after_.managerImd, 1_000 ether, "the swapper's IMD is now in the manager");
+        assertEq(FEE_ON_1000_IN, (1_000 ether - FEE_ON_1000_IN) / 100, "1% of the pool's IMD leg");
     }
 
     function test_anyoneCanCollectThePendingFeeForTheRecipient() public {
         buy(-1_000 ether);
-        assertEq(hook.pendingFees(), 10 ether);
+        assertEq(hook.pendingFees(), FEE_ON_1000_IN);
 
         vm.expectEmit(address(hook));
-        emit RNNNImdFeeHook.FeePaid(10 ether);
+        emit RNNNImdFeeHook.FeePaid(FEE_ON_1000_IN);
         vm.prank(address(0xA11CE));
         uint256 paid = hook.collectPending();
 
-        assertEq(paid, 10 ether);
-        assertEq(imd.balanceOf(FEE_RECIPIENT), 10 ether, "the recipient received exactly 1% in IMD");
+        assertEq(paid, FEE_ON_1000_IN);
+        assertEq(imd.balanceOf(FEE_RECIPIENT), FEE_ON_1000_IN, "the recipient received exactly 1% in IMD");
         assertEq(hook.pendingFees(), 0);
         assertEq(imd.balanceOf(address(hook)), 0);
-        assertEq(imd.balanceOf(address(manager)), 990 ether);
+        assertEq(imd.balanceOf(address(manager)), 1_000 ether - FEE_ON_1000_IN);
     }
 
     function test_nextSwapDeliversTheDeferredFeeAlongWithItsOwn() public {
         buy(-1_000 ether);
-        assertEq(hook.pendingFees(), 10 ether);
+        assertEq(hook.pendingFees(), FEE_ON_1000_IN);
 
         vm.expectEmit(address(hook));
-        emit RNNNImdFeeHook.FeePaid(20 ether);
+        emit RNNNImdFeeHook.FeePaid(2 * FEE_ON_1000_IN);
         buy(-1_000 ether);
 
-        assertEq(imd.balanceOf(FEE_RECIPIENT), 20 ether, "both fees delivered");
+        assertEq(imd.balanceOf(FEE_RECIPIENT), 2 * FEE_ON_1000_IN, "both fees delivered");
         assertEq(hook.pendingFees(), 0);
+    }
+
+    /// @dev Finding 789cc455, case B: the launch pool holds no IMD, so an exact-output sell can fill
+    /// nothing. The old hook charged 1% of the IMD asked for and paid out none. Now the fill is short,
+    /// the manager has no IMD to return the declared fee from, and the swap is refused: the seller's
+    /// IMD is untouched and the recipient is owed nothing.
+    function test_exactOutputSellThatCannotFillIsRefusedNotCharged() public {
+        Balances memory before = snapshot();
+
+        vm.expectRevert(wrappedAfterSwapRevert(RNNNImdFeeHook.ShortFillNotRefundable.selector));
+        sell(int256(1_000 ether));
+
+        Balances memory after_ = snapshot();
+        assertEq(after_.swapperImd, before.swapperImd, "a seller never ends a sell with less IMD");
+        assertEq(after_.swapperRnnn, before.swapperRnnn);
+        assertEq(after_.recipientImd, before.recipientImd);
+        assertEq(hook.pendingFees(), 0, "nothing booked for the recipient");
+    }
+
+    /// @dev Same state, exact-input buy with a price limit one spacing away: the pool fills only up
+    /// to the limit, the manager holds no IMD yet, and the swap is refused rather than charged 1% of
+    /// the whole order.
+    function test_priceLimitedBuyBeforeAnyImdIsInTheManagerIsRefused() public {
+        ActualDeltaRouter router = new ActualDeltaRouter(manager);
+        imd.approve(address(router), type(uint256).max);
+        Balances memory before = snapshot();
+        SwapParams memory params = limitedParams(imdIsCurrency0, -100_000 ether);
+
+        vm.expectRevert(wrappedAfterSwapRevert(RNNNImdFeeHook.ShortFillNotRefundable.selector));
+        router.swap(key, params, 100_000 ether);
+
+        Balances memory after_ = snapshot();
+        assertEq(after_.swapperImd, before.swapperImd);
+        assertEq(hook.pendingFees(), 0);
+    }
+
+    /// @dev Once one buy has settled, the manager holds IMD and a short fill is trued up instead.
+    function test_priceLimitedBuyAfterTheFirstBuyIsTruedUpToTheFill() public {
+        buy(-1_000 ether);
+        ActualDeltaRouter router = new ActualDeltaRouter(manager);
+        imd.approve(address(router), type(uint256).max);
+        Balances memory before = snapshot();
+
+        router.swap(key, limitedParams(imdIsCurrency0, -100_000 ether), 100_000 ether);
+
+        Balances memory after_ = snapshot();
+        uint256 paid = before.swapperImd - after_.swapperImd;
+        uint256 delivered = after_.recipientImd - before.recipientImd;
+        uint256 pooled = after_.managerImd - before.managerImd;
+        assertLt(paid, 100_000 ether, "only the filled part was paid for");
+        assertEq(hook.pendingFees(), 0, "the earlier claim rode along with this fee");
+        assertEq(paid, pooled + delivered, "IMD is conserved");
+        // The manager gave up the earlier claim out of its balance, so the pool's leg this swap is
+        // what it gained plus that claim; this swap's own fee is what was delivered beyond the claim.
+        uint256 poolLeg = pooled + FEE_ON_1000_IN;
+        uint256 feeThisSwap = delivered - FEE_ON_1000_IN;
+        assertEq(feeThisSwap, poolLeg / 100, "1% of the IMD that actually traded");
+        assertEq(paid, poolLeg + feeThisSwap, "the swapper paid the fill plus 1%, nothing on the unfilled rest");
     }
 
     function test_sellOnAFreshPoolAfterABuyPaysAtOnce() public {
@@ -560,5 +682,184 @@ contract RNNNImdFeeHookFreshPoolTest is RNNNImdFeeHookTestBase {
         assertEq(rnnn.balanceOf(FEE_RECIPIENT), 0);
         assertEq(rnnn.balanceOf(address(hook)), 0);
         assertEq(imd.balanceOf(address(hook)), 0);
+    }
+}
+
+/// @notice Short fills on a funded pool (finding 789cc455, case A): a price limit stops the pool
+/// before the specified amount is used up. The fee must be 1% of what traded, and the swapper must
+/// pay for nothing else. These swaps go through a router that settles the PoolManager's actual
+/// deltas, as the Universal Router does, because the hook returns the unowed part of the declared
+/// fee to the router inside the swap.
+contract RNNNImdFeeHookShortFillTest is RNNNImdFeeHookTestBase {
+    ActualDeltaRouter router;
+
+    function setUp() public override {
+        super.setUp();
+        initializeFromFactory();
+        addFullRangeLiquidity(1_000_000 ether);
+        router = new ActualDeltaRouter(manager);
+        imd.approve(address(router), type(uint256).max);
+        rnnn.approve(address(router), type(uint256).max);
+    }
+
+    function test_priceLimitedExactInputBuy_paysOnePercentOfTheImdThatTraded() public {
+        Balances memory before = snapshot();
+        uint256 requested = 100_000 ether;
+
+        router.swap(key, limitedParams(imdIsCurrency0, -int256(requested)), requested);
+
+        Balances memory after_ = snapshot();
+        uint256 fee = after_.recipientImd - before.recipientImd;
+        uint256 paid = before.swapperImd - after_.swapperImd;
+        uint256 poolLeg = after_.managerImd - before.managerImd;
+        assertLt(poolLeg, requested / 2, "the limit stopped the fill well short of the order");
+        assertGt(fee, 0);
+        assertEq(fee, poolLeg / 100, "fee is 1% of the IMD side that traded, not of the order");
+        assertEq(paid, poolLeg + fee, "the swapper paid the fill plus its 1%, nothing on the rest");
+        assertEq(after_.hookImd, 0, "the hook keeps nothing");
+        assertEq(hook.pendingFees(), 0);
+        assertEq(imd.balanceOf(address(router)), 0, "the router returned the unused input");
+    }
+
+    function test_priceLimitedExactInputBuy_emitsTheRefund() public {
+        uint256 requested = 100_000 ether;
+        uint256 declared = requested / 101;
+        uint256 recipientBefore = imd.balanceOf(FEE_RECIPIENT);
+        vm.recordLogs();
+        router.swap(key, limitedParams(imdIsCurrency0, -int256(requested)), requested);
+        uint256 fee = imd.balanceOf(FEE_RECIPIENT) - recipientBefore;
+
+        bool seen;
+        VmSafe.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == RNNNImdFeeHook.FeeRefunded.selector) {
+                assertEq(abi.decode(logs[i].data, (uint256)), declared - fee, "refund is the unowed part");
+                seen = true;
+            }
+        }
+        assertTrue(seen, "FeeRefunded emitted");
+    }
+
+    function test_priceLimitedExactOutputSell_paysOnePercentOfTheImdThatTraded() public {
+        Balances memory before = snapshot();
+        uint256 requested = 100_000 ether;
+
+        router.swap(key, limitedParams(!imdIsCurrency0, int256(requested)), 1_000_000 ether);
+
+        Balances memory after_ = snapshot();
+        uint256 fee = after_.recipientImd - before.recipientImd;
+        uint256 received = after_.swapperImd - before.swapperImd;
+        uint256 poolLeg = before.managerImd - after_.managerImd;
+        assertLt(received, requested / 2, "the limit stopped the fill well short of the order");
+        assertGt(fee, 0);
+        assertEq(fee, poolLeg / 100, "fee is 1% of the IMD side that traded");
+        assertEq(received, poolLeg - fee, "the seller received the fill minus its 1%");
+        assertEq(hook.pendingFees(), 0);
+        assertEq(rnnn.balanceOf(address(router)), 0, "the router returned the unused RNNN");
+    }
+
+    /// @dev The same router on full fills agrees with the PoolSwapTest results: no refund happens
+    /// when the fill is complete.
+    function test_fullFillThroughTheActualDeltaRouterNeedsNoRefund() public {
+        Balances memory before = snapshot();
+        SwapParams memory params = SwapParams({
+            zeroForOne: imdIsCurrency0,
+            amountSpecified: -1_000 ether,
+            sqrtPriceLimitX96: imdIsCurrency0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+        });
+        router.swap(key, params, 1_000 ether);
+        Balances memory after_ = snapshot();
+        assertEq(before.swapperImd - after_.swapperImd, 1_000 ether);
+        assertEq(after_.recipientImd - before.recipientImd, uint256(1_000 ether) / 101);
+    }
+
+    /// @dev Finding 72cf4725: an order far beyond any balance is "swap to the limit" in v4. The hook
+    /// no longer fails a cast on it; it declares a fee within the delta range and the swap then
+    /// follows the short-fill rule. The unowed part here exceeds all the IMD that exists, so the
+    /// refund cannot be sourced and the swap is refused with the hook's own error, not an overflow.
+    function test_oversizedOrderFailsWithTheShortFillErrorNotAnOverflow() public {
+        int256 huge = -(100 * int256(type(int128).max) + 100);
+        uint256 everything = imd.balanceOf(address(this));
+        SwapParams memory params = limitedParams(imdIsCurrency0, huge);
+        vm.expectRevert(wrappedAfterSwapRevert(RNNNImdFeeHook.ShortFillNotRefundable.selector));
+        router.swap(key, params, everything);
+    }
+
+    /// @dev An oversized order the manager can refund goes through: 1,000 IMD trades at most to the
+    /// limit, the declared fee is 1/101 of the order, and the manager holds enough IMD to return the
+    /// difference.
+    function test_largeOrderWithinTheManagersImdIsTruedUp() public {
+        Balances memory before = snapshot();
+        uint256 requested = 50_000_000 ether;
+        router.swap(key, limitedParams(imdIsCurrency0, -int256(requested)), requested);
+        Balances memory after_ = snapshot();
+        uint256 fee = after_.recipientImd - before.recipientImd;
+        uint256 poolLeg = after_.managerImd - before.managerImd;
+        assertEq(fee, poolLeg / 100);
+        assertEq(before.swapperImd - after_.swapperImd, poolLeg + fee);
+    }
+}
+
+/// @notice Finding f766513a: IMD on Robinhood Chain carries a blocklist. If the recipient is ever
+/// blocked, the fee is held as a claim rather than halting swaps, and is delivered once the transfer
+/// is accepted again.
+contract RNNNImdFeeHookBlockedRecipientTest is RNNNImdFeeHookTestBase {
+    function setUp() public override {
+        super.setUp();
+        initializeFromFactory();
+        addFullRangeLiquidity(1_000_000 ether);
+        imd.setBlocked(FEE_RECIPIENT, true);
+    }
+
+    function test_buyStillTradesAndDefersTheFeeWhenTheRecipientIsBlocked() public {
+        Balances memory before = snapshot();
+        uint256 expectedFee = uint256(1_000 ether) / 101;
+
+        vm.expectEmit(address(hook));
+        emit RNNNImdFeeHook.FeeDeferred(expectedFee);
+        buy(-1_000 ether);
+
+        Balances memory after_ = snapshot();
+        assertEq(before.swapperImd - after_.swapperImd, 1_000 ether, "the trade went through");
+        assertGt(after_.swapperRnnn, before.swapperRnnn);
+        assertEq(after_.recipientImd, before.recipientImd, "nothing could be delivered");
+        assertEq(hook.pendingFees(), expectedFee, "the fee waits as a claim");
+    }
+
+    function test_sellStillTradesAndDefersTheFeeWhenTheRecipientIsBlocked() public {
+        Balances memory before = snapshot();
+        sell(-1_000 ether);
+        Balances memory after_ = snapshot();
+        uint256 poolLeg = before.managerImd - after_.managerImd + hook.pendingFees();
+        assertGt(after_.swapperImd, before.swapperImd, "the seller was paid");
+        assertEq(hook.pendingFees(), poolLeg / 100, "1% waits as a claim");
+        assertEq(after_.recipientImd, before.recipientImd);
+    }
+
+    function test_claimsAreDeliveredOnceTheRecipientIsUnblocked() public {
+        buy(-1_000 ether);
+        sell(-1_000 ether);
+        uint256 pending = hook.pendingFees();
+        assertGt(pending, 0);
+
+        vm.prank(address(0xA11CE));
+        vm.expectRevert();
+        hook.collectPending();
+
+        imd.setBlocked(FEE_RECIPIENT, false);
+        vm.prank(address(0xA11CE));
+        uint256 paid = hook.collectPending();
+        assertEq(paid, pending);
+        assertEq(imd.balanceOf(FEE_RECIPIENT), pending);
+        assertEq(hook.pendingFees(), 0);
+    }
+
+    function test_nextSwapAfterUnblockingDeliversEverything() public {
+        buy(-1_000 ether);
+        uint256 pending = hook.pendingFees();
+        imd.setBlocked(FEE_RECIPIENT, false);
+        buy(-1_000 ether);
+        assertEq(imd.balanceOf(FEE_RECIPIENT), pending + uint256(1_000 ether) / 101);
+        assertEq(hook.pendingFees(), 0);
     }
 }

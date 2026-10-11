@@ -2,7 +2,8 @@
 pragma solidity 0.8.26;
 
 /// @notice A minimal ERC-20 for tests. Mints `supply` to the deployer; `mint` is open so tests can
-/// fund whichever account they need.
+/// fund whichever account they need. `setBlocked` models a token with a per-address blocklist, as the
+/// live IMD has: transfers to or from a blocked address revert.
 contract MockERC20 {
     string public name;
     string public symbol;
@@ -11,6 +12,7 @@ contract MockERC20 {
 
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
+    mapping(address => bool) public blocked;
 
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
@@ -23,6 +25,10 @@ contract MockERC20 {
 
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
+    }
+
+    function setBlocked(address account, bool isBlocked) external {
+        blocked[account] = isBlocked;
     }
 
     function approve(address spender, uint256 value) external returns (bool) {
@@ -53,6 +59,7 @@ contract MockERC20 {
     }
 
     function _transfer(address from, address to, uint256 value) internal {
+        require(!blocked[from] && !blocked[to], "MockERC20: blocked");
         require(balanceOf[from] >= value, "MockERC20: balance");
         balanceOf[from] -= value;
         balanceOf[to] += value;

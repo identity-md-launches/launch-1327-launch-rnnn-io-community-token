@@ -20,18 +20,28 @@ import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
 ///
 /// - The fee is always taken from the IMD side of the swap, never from RNNN, and it is never swapped
 ///   into anything else. The recipient receives IMD.
-/// - When IMD is the *specified* currency (an exact-input buy, or an exact-output sell), the fee is
-///   declared in `beforeSwap` through `beforeSwapReturnDelta`: the pool trades 1% less IMD on a buy
-///   and 1% more on a sell, and the swapper's total is unchanged from what they asked for.
+/// - The fee is 1% (floor) of the IMD the pool actually traded in the swap, on every swap shape. It is
+///   computed in `afterSwap` from the pool's own `BalanceDelta`, never from the amount the swapper
+///   asked for, so a swap the pool fills only partly (a price limit reached, liquidity exhausted) pays
+///   1% of what traded and nothing on what did not.
 /// - When IMD is the *unspecified* currency (an exact-output buy, or an exact-input sell), the fee is
-///   declared in `afterSwap` through `afterSwapReturnDelta`: the swapper pays 1% more IMD on a buy and
+///   charged in `afterSwap` through `afterSwapReturnDelta`: the swapper pays 1% more IMD on a buy and
 ///   receives 1% less IMD on a sell.
-/// - Either way the fee is 1% (floor) of the IMD amount the pool quoted for the swap, and the hook
-///   settles it in `afterSwap`. If the PoolManager already holds enough IMD, the fee is transferred to
-///   the recipient at once with `take`. If it does not (a freshly seeded pool holds no IMD until the
-///   first buy settles), the hook mints itself an ERC-6909 claim for the amount instead, and the claim
-///   is redeemed on the next swap that finds enough IMD or by anyone calling `collectPending`. No swap
-///   ever fails because the fee could not be delivered.
+/// - When IMD is the *specified* currency (an exact-input buy, or an exact-output sell), v4 only lets
+///   a hook charge that currency in `beforeSwap`, before the fill is known. `beforeSwap` therefore
+///   declares the fee a full fill would owe (X/101 of an exact input, Y/99 of an exact output, so that
+///   it equals 1% of the pool's IMD leg when everything trades), and `afterSwap` compares it with the
+///   fee the executed amount really owes. Any excess is returned to the swapper's router inside the
+///   same unlock (`take` to the hook, `sync`, transfer, `settleFor(router)`), so the router settles
+///   only what traded plus 1%. That refund is paid from the IMD the PoolManager holds; when it holds
+///   too little (the launch pool before its first buy settles) a short fill is refused with
+///   `ShortFillNotRefundable` rather than mischarged. A full fill never needs a refund.
+/// - The hook settles the fee in `afterSwap`. If the PoolManager holds enough IMD and the recipient
+///   accepts the transfer, the fee is delivered at once with `take`. If it does not (a freshly seeded
+///   pool holds no IMD until the first buy settles), or the transfer to the recipient fails, the hook
+///   mints itself an ERC-6909 claim for the amount instead, and the claim is redeemed on the next swap
+///   that can deliver it or by anyone calling `collectPending`. No swap fails because the fee could
+///   not be delivered.
 /// - `beforeInitialize` accepts any pool that has IMD on one side, from any initializer, with any LP
 ///   fee and tick spacing. It exists so nobody can open the launch pool before the hook has code.
 /// - There is no owner, no pause, no mint, no setter, no other fee, and nothing that blocks or alters
@@ -43,6 +53,18 @@ contract RNNNImdFeeHook is IHooks, IUnlockCallback {
     /// @notice The fee, in basis points of the IMD side of each swap. 100 bps = 1%.
     uint256 public constant FEE_BPS = 100;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
+    /// @dev An exact-input swap of X IMD covers the pool's leg E plus the fee E * 1%, so the full-fill
+    /// fee is X * FEE_BPS / (BPS_DENOMINATOR + FEE_BPS) = X / 101. Written as a divisor so the
+    /// arithmetic cannot overflow for any `amountSpecified`.
+    uint256 internal constant EXACT_INPUT_FEE_DIVISOR = (BPS_DENOMINATOR + FEE_BPS) / FEE_BPS;
+    /// @dev An exact-output swap for Y IMD is the pool's leg E minus the fee E * 1%, so the full-fill
+    /// fee is Y * FEE_BPS / (BPS_DENOMINATOR - FEE_BPS) = Y / 99.
+    uint256 internal constant EXACT_OUTPUT_FEE_DIVISOR = (BPS_DENOMINATOR - FEE_BPS) / FEE_BPS;
+    /// @dev The largest delta v4 can carry; a declared fee is clamped to it so the hook never fails
+    /// a cast where the pool itself would still trade.
+    // Safe: type(int128).max is positive, so it fits uint128 unchanged.
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint256 internal constant MAX_DELTA = uint256(uint128(type(int128).max));
 
     /// @notice The Uniswap v4 PoolManager this hook serves.
     IPoolManager public immutable poolManager;
@@ -55,14 +77,21 @@ contract RNNNImdFeeHook is IHooks, IUnlockCallback {
 
     /// @notice A fee was delivered to `feeRecipient`, in IMD.
     event FeePaid(uint256 amount);
-    /// @notice A fee could not be delivered yet because the PoolManager did not hold enough IMD; the
-    /// hook holds it as an ERC-6909 claim until `collectPending` or a later swap delivers it.
+    /// @notice A fee could not be delivered yet, because the PoolManager did not hold enough IMD or
+    /// the recipient refused the transfer; the hook holds it as an ERC-6909 claim until
+    /// `collectPending` or a later swap delivers it.
     event FeeDeferred(uint256 amount);
+    /// @notice A swap whose IMD side was specified filled only partly: the part of the declared fee
+    /// that the executed amount did not owe was returned to the swapper's router.
+    event FeeRefunded(uint256 amount);
 
     error NotPoolManager();
     error ZeroAddress();
     error PoolHasNoImdSide();
     error HookNotImplemented();
+    /// @notice An IMD-specified swap filled short and the PoolManager held too little IMD to return
+    /// the unowed part of the declared fee, so the swap is refused instead of overcharged.
+    error ShortFillNotRefundable();
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -153,30 +182,37 @@ contract RNNNImdFeeHook is IHooks, IUnlockCallback {
     {
         BeforeSwapDelta delta = toBeforeSwapDelta(0, 0);
         if (_imdIsSpecified(key, params)) {
-            // IMD is the specified amount: shave the fee off what the pool trades. The swapper's total
-            // in IMD stays exactly what they specified.
-            uint256 fee = _feeOf(_abs(params.amountSpecified));
-            if (fee > 0) delta = toBeforeSwapDelta(fee.toInt128(), 0);
+            // IMD is the specified amount: declare the fee a full fill owes, so the pool trades that
+            // much less IMD on a buy and that much more on a sell. afterSwap trues it up to the fill.
+            uint256 declared = _declaredFee(params);
+            if (declared > 0) delta = toBeforeSwapDelta(declared.toInt128(), 0);
         }
         return (IHooks.beforeSwap.selector, delta, 0);
     }
 
     /// @inheritdoc IHooks
-    function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
-        external
-        onlyPoolManager
-        returns (bytes4, int128)
-    {
-        uint256 fee;
+    /// @dev `delta` is the pool's own result, before the hook's deltas are applied to it, so its IMD
+    /// amount is exactly what the pool traded: the base of the fee on every path.
+    function afterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata
+    ) external onlyPoolManager returns (bytes4, int128) {
+        int256 imdAmount = key.currency0 == imd ? delta.amount0() : delta.amount1();
+        uint256 fee = _feeOf(_abs(imdAmount));
         int128 hookDeltaUnspecified = 0;
         if (_imdIsSpecified(key, params)) {
-            // Already declared in beforeSwap; only settle it here.
-            fee = _feeOf(_abs(params.amountSpecified));
+            // beforeSwap already charged `declared`; keep what the fill owes and return the rest to
+            // the swapper's router. On a full fill the two agree and nothing is returned.
+            uint256 declared = _declaredFee(params);
+            if (fee > declared) fee = declared;
+            uint256 excess = declared - fee;
+            if (excess > 0) _refund(sender, excess);
         } else {
             // IMD is the unspecified side: charge the fee on top of (buy) or out of (sell) what the
-            // pool quoted.
-            int256 imdAmount = key.currency0 == imd ? delta.amount0() : delta.amount1();
-            fee = _feeOf(_abs(imdAmount));
+            // pool traded.
             if (fee > 0) hookDeltaUnspecified = fee.toInt128();
         }
         if (fee > 0) _settleFee(fee);
@@ -245,28 +281,48 @@ contract RNNNImdFeeHook is IHooks, IUnlockCallback {
     // ---------------------------------------------------------------------------------------------
 
     /// @dev Deliver `fee` IMD to the recipient from the PoolManager's balance, or hold it as a claim
-    /// when the manager does not hold enough yet. Whatever is delivered also carries along as much of
-    /// any earlier claim as the balance allows. Called inside the swap's unlock, after the hook has
-    /// been credited the fee, so the hook's deltas net to zero by the end of the callback.
+    /// when the manager does not hold enough yet or the recipient refuses the transfer. Whatever is
+    /// delivered also carries along as much of any earlier claim as the balance allows. Called inside
+    /// the swap's unlock, after the hook has been credited the fee, so the hook's deltas net to zero
+    /// by the end of the callback.
     function _settleFee(uint256 fee) internal {
         uint256 available = imd.balanceOf(address(poolManager));
-        if (available < fee) {
-            poolManager.mint(address(this), imd.toId(), fee);
-            emit FeeDeferred(fee);
-            return;
-        }
-        uint256 payout = fee;
-        uint256 pending = pendingFees();
-        if (pending > 0) {
+        if (available >= fee) {
+            uint256 pending = pendingFees();
             uint256 room = available - fee;
             uint256 extra = pending < room ? pending : room;
-            if (extra > 0) {
-                poolManager.burn(address(this), imd.toId(), extra);
-                payout += extra;
-            }
+            try poolManager.take(imd, feeRecipient, fee + extra) {
+                if (extra > 0) poolManager.burn(address(this), imd.toId(), extra);
+                emit FeePaid(fee + extra);
+                return;
+            } catch {}
         }
-        poolManager.take(imd, feeRecipient, payout);
-        emit FeePaid(payout);
+        poolManager.mint(address(this), imd.toId(), fee);
+        emit FeeDeferred(fee);
+    }
+
+    /// @dev Return `amount` IMD of an over-declared fee to `router`, the contract that called
+    /// `PoolManager.swap` for the swapper: take it from the PoolManager to the hook, then pay it
+    /// straight back in on the router's behalf, so the router's IMD debt shrinks by `amount` and the
+    /// hook ends with nothing. The round trip needs the manager to hold the IMD; when it does not, the
+    /// short fill cannot be charged correctly and is refused.
+    function _refund(address router, uint256 amount) internal {
+        if (imd.balanceOf(address(poolManager)) < amount) revert ShortFillNotRefundable();
+        poolManager.take(imd, address(this), amount);
+        poolManager.sync(imd);
+        imd.transfer(address(poolManager), amount);
+        // The amount settled is the balance difference `sync` measures, which is exactly `amount`.
+        // forge-lint: disable-next-line(unused-return)
+        poolManager.settleFor(router);
+        emit FeeRefunded(amount);
+    }
+
+    /// @dev The fee `beforeSwap` declares when IMD is the specified currency: what a full fill owes,
+    /// clamped to the delta range so an oversized request is left to the pool to cap.
+    function _declaredFee(SwapParams calldata params) internal pure returns (uint256 fee) {
+        uint256 amount = _abs(params.amountSpecified);
+        fee = params.amountSpecified < 0 ? amount / EXACT_INPUT_FEE_DIVISOR : amount / EXACT_OUTPUT_FEE_DIVISOR;
+        if (fee > MAX_DELTA) fee = MAX_DELTA;
     }
 
     /// @dev Whether IMD is the swap's specified currency: the input of an exact-input swap or the
