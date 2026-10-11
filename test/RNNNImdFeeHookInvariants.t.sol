@@ -2,6 +2,8 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
@@ -20,26 +22,33 @@ import {PoolClaimsTest} from "v4-core/src/test/PoolClaimsTest.sol";
 import {RNNNImdFeeHook} from "../src/RNNNImdFeeHook.sol";
 import {RNNNToken} from "../src/RNNNToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {ActualDeltaRouter} from "./mocks/ActualDeltaRouter.sol";
 import {RNNNImdFixture} from "./utils/RNNNImdFixture.sol";
 
 /// @notice Drives the RNNN/IMD pool with random, bounded actions from several actors: all four swap
-/// shapes, liquidity in and out, donations, gifted ERC-6909 claims and `collectPending`. Every action
-/// checks the hook's local promise (the fee for this swap is exactly floor(1%) of its IMD side, the hook
-/// keeps nothing, liquidity and donations pay nothing) and records ghost totals for the invariants.
+/// shapes, with and without a price limit that stops the pool short, liquidity in and out, donations,
+/// gifted ERC-6909 claims and `collectPending`. Every action checks the hook's local promise (the fee
+/// for this swap is exactly floor(1%) of the IMD the pool traded, capped at what `beforeSwap` declared;
+/// the swapper's IMD moves by that leg plus or minus the fee; the hook keeps nothing; liquidity and
+/// donations pay nothing) and records ghost totals for the invariants.
 /// @dev Handler calls must not revert: the suites run with `fail-on-revert`, so a revert is a finding.
+/// The one revert the hook documents, `ShortFillNotRefundable`, is caught and checked against its
+/// stated precondition instead.
 contract FeeHookHandler is Test {
     using StateLibrary for IPoolManager;
 
     address constant FEE_RECIPIENT = 0x45C89d0CF0B8a05218506236FcfcB18DA1D3ebE4;
     int24 constant MIN_TICK = -887_220;
     int24 constant MAX_TICK = 887_220;
+    int24 constant TICK_SPACING = 60;
     /// @dev Per-swap ceiling. Against 1e6 ether of base liquidity a swap this size always fills in full
-    /// on the funded pool, so the exact-1% assertion is never skipped there.
+    /// on the funded pool when it carries no price limit.
     uint256 constant MAX_SWAP = 10_000 ether;
     uint256 constant MAX_LIQUIDITY = 1_000 ether;
 
     PoolManager public manager;
     PoolSwapTest public swapRouter;
+    ActualDeltaRouter public actualRouter;
     PoolModifyLiquidityTestNoChecks public lpRouter;
     PoolDonateTest public donateRouter;
     PoolClaimsTest public claimsRouter;
@@ -55,14 +64,15 @@ contract FeeHookHandler is Test {
     // ---- ghost state ----
     /// @dev Everything the hook ever took as a fee: delivered to the recipient or held as a claim.
     uint256 public ghost_feesTaken;
-    /// @dev Fees on swaps the pool filled completely, and the independent floor(1%) each should have been.
-    uint256 public ghost_feesOnFullFills;
-    uint256 public ghost_expectedFeesOnFullFills;
-    uint256 public ghost_imdVolumeOnFullFills;
-    /// @dev Swaps the pool filled only partly. The fee on those is a reported defect (see
-    /// .imd-findings.json), so they are counted here and excluded from the exact-1% check.
-    uint256 public ghost_partialFills;
-    uint256 public ghost_overchargeOnPartialFills;
+    /// @dev The independent floor(1%) of each swap's pool leg (capped at the declaration where IMD was
+    /// specified), summed; and the legs themselves.
+    uint256 public ghost_expectedFees;
+    uint256 public ghost_imdVolume;
+    /// @dev Swaps the pool filled only partly and the hook trued up, and what it handed back on them.
+    uint256 public ghost_shortFills;
+    uint256 public ghost_refunded;
+    /// @dev Swaps the hook refused with `ShortFillNotRefundable`.
+    uint256 public ghost_refusedSwaps;
     uint256 public ghost_claimsGifted;
     uint256 public ghost_collected;
     uint256 public ghost_imdDonated;
@@ -77,6 +87,7 @@ contract FeeHookHandler is Test {
     constructor(
         PoolManager manager_,
         PoolSwapTest swapRouter_,
+        ActualDeltaRouter actualRouter_,
         PoolModifyLiquidityTestNoChecks lpRouter_,
         PoolDonateTest donateRouter_,
         PoolClaimsTest claimsRouter_,
@@ -88,6 +99,7 @@ contract FeeHookHandler is Test {
     ) {
         manager = manager_;
         swapRouter = swapRouter_;
+        actualRouter = actualRouter_;
         lpRouter = lpRouter_;
         donateRouter = donateRouter_;
         claimsRouter = claimsRouter_;
@@ -101,25 +113,28 @@ contract FeeHookHandler is Test {
 
     // ------------------------------------------------------------------ swaps
 
-    /// @notice Exact-input buy: spend `amount` IMD. IMD is the specified currency, so the fee is declared
-    /// in beforeSwap and the swapper pays exactly what they specified.
-    function buyExactIn(uint256 actorSeed, uint256 amount) external countCall("buyExactIn") {
+    /// @notice Exact-input buy: spend `amount` IMD. IMD is the specified currency, so `beforeSwap` declares
+    /// 1/101 of it and `afterSwap` trues that up to the fill. `spacings` sets a price limit that many tick
+    /// spacings away (0: none), so the pool may stop short.
+    function buyExactIn(uint256 actorSeed, uint256 amount, uint8 spacings) external countCall("buyExactIn") {
         address actor = _actor(actorSeed);
         amount = bound(amount, 1, _min(MAX_SWAP, imd.balanceOf(actor)));
         if (amount == 0) return;
+        spacings = uint8(bound(spacings, 0, 40));
 
-        (BalanceDelta delta, uint256 fee) = _swap(actor, imdIsCurrency0, -int256(amount));
-        int256 imdDelta = _imdDelta(delta);
-        assertLe(imdDelta, 0, "a buy never pays the swapper IMD");
-        assertGe(_rnnnDelta(delta), 0, "a buy never takes RNNN from the swapper");
-        uint256 paid = uint256(-imdDelta);
+        Books memory a = _books(actor);
+        bool ok = _swapSpecified(actor, imdIsCurrency0, -int256(amount), spacings, amount);
+        Books memory b = _books(actor);
+        if (!ok) return;
+
+        uint256 fee = _feeTaken(a, b);
+        uint256 leg = _poolImdLeg(a, b, true);
+        uint256 paid = a.actorImd - b.actorImd;
         assertLe(paid, amount, "the swapper never pays more IMD than specified");
-
-        if (paid == amount) {
-            _recordFullFill(fee, amount);
-        } else {
-            _recordPartialFill(fee, paid);
-        }
+        assertGe(b.actorRnnn, a.actorRnnn, "a buy never takes RNNN from the swapper");
+        _checkSwap(fee, leg, _declared(-int256(amount)), paid, true);
+        if (paid < amount) _recordShortFill(_declared(-int256(amount)) - fee);
+        else assertEq(leg + fee, amount, "a full fill uses the whole input: leg plus fee");
     }
 
     /// @notice Exact-output buy: receive `rnnnOut` RNNN. IMD is unspecified, so the fee is 1% of the IMD
@@ -128,16 +143,14 @@ contract FeeHookHandler is Test {
         address actor = _actor(actorSeed);
         rnnnOut = bound(rnnnOut, 1, MAX_SWAP);
 
-        (BalanceDelta delta, uint256 fee) = _swap(actor, imdIsCurrency0, int256(rnnnOut));
-        int256 imdDelta = _imdDelta(delta);
-        assertLe(imdDelta, 0, "a buy never pays the swapper IMD");
-        uint256 paid = uint256(-imdDelta);
-        assertGe(paid, fee, "the fee is part of what the swapper paid");
-        uint256 pooled = paid - fee;
-        // The hook measured the pool's own IMD delta, so this holds whether or not the fill was complete.
-        assertEq(fee, pooled / 100, "exact-output buy: fee is floor(1%) of the IMD the pool quoted");
+        Books memory a = _books(actor);
+        BalanceDelta delta = _swapUnspecified(actor, imdIsCurrency0, int256(rnnnOut));
+        Books memory b = _books(actor);
+
+        uint256 fee = _feeTaken(a, b);
+        uint256 leg = _poolImdLeg(a, b, true);
         assertLe(uint256(_rnnnDelta(delta)), rnnnOut, "the swapper never receives more RNNN than asked");
-        _recordFullFill(fee, pooled);
+        _checkSwap(fee, leg, type(uint256).max, a.actorImd - b.actorImd, true);
     }
 
     /// @notice Exact-input sell: spend `rnnnIn` RNNN. IMD is unspecified; the swapper receives the pool's
@@ -151,36 +164,38 @@ contract FeeHookHandler is Test {
         if (deliverable == 0 || _priceAtLimit(!imdIsCurrency0)) return;
         rnnnIn = bound(rnnnIn, 1, _min(_min(MAX_SWAP, deliverable), rnnn.balanceOf(actor)));
 
-        (BalanceDelta delta, uint256 fee) = _swap(actor, !imdIsCurrency0, -int256(rnnnIn));
-        int256 imdDelta = _imdDelta(delta);
-        assertGe(imdDelta, 0, "an exact-input sell never charges the swapper IMD");
-        uint256 received = uint256(imdDelta);
-        uint256 pooledOut = received + fee;
-        assertEq(fee, pooledOut / 100, "exact-input sell: fee is floor(1%) of the IMD the pool paid out");
+        Books memory a = _books(actor);
+        BalanceDelta delta = _swapUnspecified(actor, !imdIsCurrency0, -int256(rnnnIn));
+        Books memory b = _books(actor);
+
+        uint256 fee = _feeTaken(a, b);
+        uint256 leg = _poolImdLeg(a, b, false);
         assertLe(uint256(-_rnnnDelta(delta)), rnnnIn, "the swapper never spends more RNNN than specified");
-        _recordFullFill(fee, pooledOut);
+        _checkSwap(fee, leg, type(uint256).max, b.actorImd - a.actorImd, false);
     }
 
-    /// @notice Exact-output sell: receive `imdOut` IMD. IMD is specified; the pool pays out 1% more and the
-    /// swapper receives exactly what they asked for.
-    /// @dev Bounded to a quarter of the IMD the pool can plausibly return so the fill is complete; a fill
-    /// that is still partial is recorded, not asserted (reported defect).
-    function sellExactOut(uint256 actorSeed, uint256 imdOut) external countCall("sellExactOut") {
+    /// @notice Exact-output sell: receive `imdOut` IMD. IMD is specified; `beforeSwap` declares 1/99 of it
+    /// and `afterSwap` trues that up to the fill. `spacings` sets a price limit (0: none).
+    function sellExactOut(uint256 actorSeed, uint256 imdOut, uint8 spacings) external countCall("sellExactOut") {
         address actor = _actor(actorSeed);
         uint256 deliverable = _imdThePoolCanReturn() / 4;
         if (deliverable == 0 || _priceAtLimit(!imdIsCurrency0)) return;
         imdOut = bound(imdOut, 1, _min(MAX_SWAP, deliverable));
+        spacings = uint8(bound(spacings, 0, 40));
 
-        (BalanceDelta delta, uint256 fee) = _swap(actor, !imdIsCurrency0, int256(imdOut));
-        int256 imdDelta = _imdDelta(delta);
-        assertLe(imdDelta, int256(imdOut), "the swapper never receives more IMD than asked");
-        assertLe(_rnnnDelta(delta), 0, "a sell never pays the swapper RNNN");
+        Books memory a = _books(actor);
+        bool ok = _swapSpecified(actor, !imdIsCurrency0, int256(imdOut), spacings, rnnn.balanceOf(actor));
+        Books memory b = _books(actor);
+        if (!ok) return;
 
-        if (imdDelta == int256(imdOut)) {
-            _recordFullFill(fee, imdOut);
-        } else {
-            _recordPartialFill(fee, imdDelta > 0 ? uint256(imdDelta) : 0);
-        }
+        uint256 fee = _feeTaken(a, b);
+        uint256 leg = _poolImdLeg(a, b, false);
+        uint256 received = b.actorImd - a.actorImd;
+        assertLe(received, imdOut, "the swapper never receives more IMD than asked");
+        assertLe(b.actorRnnn, a.actorRnnn, "a sell never pays the swapper RNNN");
+        _checkSwap(fee, leg, _declared(int256(imdOut)), received, false);
+        if (received < imdOut) _recordShortFill(_declared(int256(imdOut)) - fee);
+        else assertEq(leg, imdOut + fee, "a full fill pays out the whole output plus the fee");
     }
 
     // ------------------------------------------------------------------ liquidity and the manager's balance
@@ -279,41 +294,126 @@ contract FeeHookHandler is Test {
 
     // ------------------------------------------------------------------ internals
 
-    function _swap(address actor, bool zeroForOne, int256 amountSpecified)
+    struct Books {
+        uint256 actorImd;
+        uint256 actorRnnn;
+        uint256 managerImd;
+        uint256 recipientImd;
+        uint256 recipientRnnn;
+        uint256 pending;
+    }
+
+    function _books(address actor) internal view returns (Books memory b) {
+        b.actorImd = imd.balanceOf(actor);
+        b.actorRnnn = rnnn.balanceOf(actor);
+        b.managerImd = imd.balanceOf(address(manager));
+        b.recipientImd = imd.balanceOf(FEE_RECIPIENT);
+        b.recipientRnnn = rnnn.balanceOf(FEE_RECIPIENT);
+        b.pending = hook.pendingFees();
+    }
+
+    /// @dev A swap whose IMD side is the unspecified currency, through v4-core's router: no refund can be
+    /// needed, so it always completes.
+    function _swapUnspecified(address actor, bool zeroForOne, int256 amountSpecified)
         internal
-        returns (BalanceDelta delta, uint256 fee)
+        returns (BalanceDelta delta)
     {
-        uint256 feesBefore = _feesInSystem();
-        uint256 recipientRnnnBefore = rnnn.balanceOf(FEE_RECIPIENT);
-
-        delta = swapAs(actor, zeroForOne, amountSpecified);
-
-        fee = _feesInSystem() - feesBefore;
-        ghost_feesTaken += fee;
+        SwapParams memory params = SwapParams(zeroForOne, amountSpecified, _limit(zeroForOne, 0));
+        vm.prank(actor);
+        delta = swapRouter.swap(key, params, PoolSwapTest.TestSettings(false, false), "");
         ghost_swaps++;
-        assertEq(rnnn.balanceOf(FEE_RECIPIENT), recipientRnnnBefore, "the recipient is never paid in RNNN");
+    }
+
+    /// @dev A swap whose IMD side is the specified currency, through the router that settles recorded
+    /// deltas, so a short fill's refund reaches it. Returns false when the hook refused the swap with
+    /// `ShortFillNotRefundable`; that is only allowed when the manager held less IMD than the declared
+    /// fee, the one case the refund cannot be sourced, and then nothing may have moved.
+    function _swapSpecified(address actor, bool zeroForOne, int256 amountSpecified, uint8 spacings, uint256 maxIn)
+        internal
+        returns (bool ok)
+    {
+        SwapParams memory params = SwapParams(zeroForOne, amountSpecified, _limit(zeroForOne, spacings));
+        Books memory a = _books(actor);
+        vm.prank(actor);
+        try actualRouter.swap(key, params, maxIn) {
+            ok = true;
+        } catch (bytes memory reason) {
+            bytes memory expected = abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(hook),
+                IHooks.afterSwap.selector,
+                abi.encodeWithSelector(RNNNImdFeeHook.ShortFillNotRefundable.selector),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            );
+            assertEq(keccak256(reason), keccak256(expected), "the only revert a swap may see is ShortFillNotRefundable");
+            assertLt(
+                a.managerImd, _declared(amountSpecified), "refused only when the manager cannot cover the declaration"
+            );
+            Books memory b = _books(actor);
+            assertEq(a.actorImd, b.actorImd, "a refused swap moves no IMD");
+            assertEq(a.actorRnnn, b.actorRnnn, "a refused swap moves no RNNN");
+            assertEq(a.pending, b.pending, "a refused swap books nothing");
+            assertEq(a.recipientImd, b.recipientImd);
+            ghost_refusedSwaps++;
+        }
+        ghost_swaps++;
+    }
+
+    /// @dev The checks every completed swap must pass, computed from balances alone: the fee this swap put
+    /// in the system is floor(1%) of the IMD the pool traded (never above the `beforeSwap` declaration
+    /// when IMD was specified), the swapper's IMD moved by the leg plus (buy) or minus (sell) that fee,
+    /// the recipient saw no RNNN and the hook holds nothing.
+    function _checkSwap(uint256 fee, uint256 leg, uint256 declared, uint256 actorImdMoved, bool isBuy) internal {
+        uint256 onePercent = leg / 100;
+        uint256 expected = onePercent < declared ? onePercent : declared;
+        assertEq(fee, expected, "fee is exactly floor(1%) of the IMD the pool traded, capped at the declaration");
+        assertLe(onePercent - fee, 1, "never more than one wei under 1% of the leg");
+        if (isBuy) assertEq(actorImdMoved, leg + fee, "a buyer pays the pool's leg plus the fee");
+        else assertEq(actorImdMoved, leg - fee, "a seller receives the pool's leg minus the fee");
+        ghost_feesTaken += fee;
+        ghost_expectedFees += expected;
+        ghost_imdVolume += leg;
+        assertEq(rnnn.balanceOf(FEE_RECIPIENT), 0, "the recipient is never paid in RNNN");
         _assertHookHoldsNothing();
     }
 
-    function swapAs(address actor, bool zeroForOne, int256 amountSpecified) internal returns (BalanceDelta) {
-        SwapParams memory params = SwapParams(
-            zeroForOne, amountSpecified, zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-        );
-        vm.prank(actor);
-        return swapRouter.swap(key, params, PoolSwapTest.TestSettings(false, false), "");
+    function _recordShortFill(uint256 refunded) internal {
+        ghost_shortFills++;
+        ghost_refunded += refunded;
     }
 
-    function _recordFullFill(uint256 fee, uint256 imdSide) internal {
-        assertEq(fee, imdSide / 100, "fee is exactly floor(1%) of the swap's IMD side");
-        ghost_feesOnFullFills += fee;
-        ghost_expectedFeesOnFullFills += imdSide / 100;
-        ghost_imdVolumeOnFullFills += imdSide;
+    /// @dev The fee the hook declares when IMD is specified, from the README's rule: 1/101 of an exact
+    /// input, 1/99 of an exact output.
+    function _declared(int256 amountSpecified) internal pure returns (uint256) {
+        return amountSpecified < 0 ? uint256(-amountSpecified) / 101 : uint256(amountSpecified) / 99;
     }
 
-    function _recordPartialFill(uint256 fee, uint256 imdMoved) internal {
-        ghost_partialFills++;
-        uint256 fair = imdMoved / 100;
-        if (fee > fair) ghost_overchargeOnPartialFills += fee - fair;
+    /// @dev Fee this swap added to the system: delivered to the recipient or booked as a claim.
+    function _feeTaken(Books memory a, Books memory b) internal pure returns (uint256) {
+        return (b.recipientImd + b.pending) - (a.recipientImd + a.pending);
+    }
+
+    /// @dev The IMD the pool itself traded, read from balances: all IMD leaving the manager goes to the
+    /// recipient (this fee or an older claim delivered along) or the swapper, and a claim minted or
+    /// burned moves the books without moving IMD. So for a buy the leg is the manager's gain less the
+    /// change in pending claims, and for a sell the manager's loss plus it.
+    function _poolImdLeg(Books memory a, Books memory b, bool isBuy) internal pure returns (uint256) {
+        int256 managerDelta = int256(b.managerImd) - int256(a.managerImd);
+        int256 pendingDelta = int256(b.pending) - int256(a.pending);
+        int256 leg = isBuy ? managerDelta - pendingDelta : pendingDelta - managerDelta;
+        assertGe(leg, 0, "a pool leg is never negative");
+        return uint256(leg);
+    }
+
+    /// @dev A price limit `spacings` tick spacings past the current price, or the furthest one when 0.
+    function _limit(bool zeroForOne, uint8 spacings) internal view returns (uint160) {
+        if (spacings == 0) return zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        (, int24 tick,,) = IPoolManager(address(manager)).getSlot0(PoolId.wrap(keccak256(abi.encode(key))));
+        int24 target =
+            zeroForOne ? tick - int24(uint24(spacings)) * TICK_SPACING : tick + int24(uint24(spacings)) * TICK_SPACING;
+        if (target < TickMath.MIN_TICK + 1) target = TickMath.MIN_TICK + 1;
+        if (target > TickMath.MAX_TICK - 1) target = TickMath.MAX_TICK - 1;
+        return TickMath.getSqrtPriceAtTick(target);
     }
 
     /// @dev An upper estimate of the IMD swappable out of the pool: what the manager holds less claims
@@ -363,6 +463,7 @@ abstract contract RNNNImdFeeHookInvariantBase is RNNNImdFixture {
 
     PoolManager manager;
     PoolSwapTest swapRouter;
+    ActualDeltaRouter actualRouter;
     PoolModifyLiquidityTestNoChecks lpRouter;
     PoolDonateTest donateRouter;
     PoolClaimsTest claimsRouter;
@@ -378,6 +479,7 @@ abstract contract RNNNImdFeeHookInvariantBase is RNNNImdFixture {
     function _deployWorld(bool imdBelow) internal {
         manager = new PoolManager(address(this));
         swapRouter = new PoolSwapTest(manager);
+        actualRouter = new ActualDeltaRouter(manager);
         lpRouter = new PoolModifyLiquidityTestNoChecks(manager);
         donateRouter = new PoolDonateTest(manager);
         claimsRouter = new PoolClaimsTest(manager);
@@ -395,11 +497,12 @@ abstract contract RNNNImdFeeHookInvariantBase is RNNNImdFixture {
         actors[0] = makeAddr("alice");
         actors[1] = makeAddr("bob");
         actors[2] = makeAddr("carol");
-        address[] memory spenders = new address[](4);
+        address[] memory spenders = new address[](5);
         spenders[0] = address(swapRouter);
         spenders[1] = address(lpRouter);
         spenders[2] = address(donateRouter);
         spenders[3] = address(claimsRouter);
+        spenders[4] = address(actualRouter);
         for (uint256 i = 0; i < actors.length; i++) {
             imd.mint(actors[i], ACTOR_FUNDS);
             rnnn.transfer(actors[i], ACTOR_FUNDS);
@@ -407,8 +510,9 @@ abstract contract RNNNImdFeeHookInvariantBase is RNNNImdFixture {
         }
         approveAll(address(this), rnnn, imd, spenders);
 
-        handler =
-            new FeeHookHandler(manager, swapRouter, lpRouter, donateRouter, claimsRouter, rnnn, imd, hook, key, actors);
+        handler = new FeeHookHandler(
+            manager, swapRouter, actualRouter, lpRouter, donateRouter, claimsRouter, rnnn, imd, hook, key, actors
+        );
         imd.mint(address(handler), ACTOR_FUNDS);
         rnnn.transfer(address(handler), ACTOR_FUNDS);
         approveAll(address(handler), rnnn, imd, spenders);
@@ -428,11 +532,25 @@ abstract contract RNNNImdFeeHookInvariantBase is RNNNImdFixture {
         );
     }
 
-    /// @notice Over every completely filled swap, the fees sum to exactly the floor(1%) of each swap's IMD
-    /// side, computed independently in the handler; never a wei more.
-    function invariant_feesAreExactlyOnePercentOfFullyFilledVolume() public view {
-        assertEq(handler.ghost_feesOnFullFills(), handler.ghost_expectedFeesOnFullFills(), "sum of floor(1%)");
-        assertLe(handler.ghost_feesOnFullFills(), handler.ghost_imdVolumeOnFullFills() / 100, "never above 1%");
+    /// @notice Over every swap that went through, full or short, the fees sum to exactly the floor(1%) of
+    /// each swap's pool leg (capped at the `beforeSwap` declaration where IMD was specified), computed
+    /// independently in the handler from balances; never a wei more than 1% of the IMD volume.
+    function invariant_feesAreExactlyOnePercentOfTradedVolume() public view {
+        assertEq(handler.ghost_feesTaken(), handler.ghost_expectedFees(), "sum of floor(1%) of each pool leg");
+        assertLe(handler.ghost_feesTaken(), handler.ghost_imdVolume() / 100, "never above 1% of the IMD traded");
+    }
+
+    /// @notice A short fill hands the unowed part of the declaration back, and the hook keeps none of it:
+    /// what was refunded never shows up with the recipient, as a claim, or with the hook.
+    function invariant_refundsNeverReachTheRecipientOrStayWithTheHook() public view {
+        assertEq(
+            imd.balanceOf(FEE_RECIPIENT) + hook.pendingFees(),
+            handler.ghost_feesTaken() + handler.ghost_claimsGifted(),
+            "a refund leaked into the fees"
+        );
+        assertEq(imd.balanceOf(address(actualRouter)), 0, "the router holds IMD after a swap");
+        assertEq(rnnn.balanceOf(address(actualRouter)), 0, "the router holds RNNN after a swap");
+        assertEq(imd.balanceOf(address(hook)), 0, "the hook holds the refund");
     }
 
     /// @notice The hook never ends up holding tokens itself; fees live in the manager as claims or go out.
@@ -478,10 +596,16 @@ contract RNNNImdFeeHookFundedPoolInvariants is RNNNImdFeeHookInvariantBase {
         addFullRange(lpRouter, key, address(this), int256(1_000_000 ether));
     }
 
-    /// @notice On a funded pool the handler's bounds keep every swap a complete fill, so the exact-1% rule
-    /// is checked on every single swap in the run, and no fee is ever deferred for long.
-    function invariant_fundedPoolNeverSeesAPartialFill() public view {
-        assertEq(handler.ghost_partialFills(), 0, "a bounded swap on 1e6 ether of liquidity did not fill");
+    /// @notice On a funded pool the manager always holds more IMD than any declaration the handler's bounds
+    /// can produce, so the refund is always sourceable: no swap is ever refused, short fills included.
+    function invariant_fundedPoolNeverRefusesASwap() public view {
+        assertEq(handler.ghost_refusedSwaps(), 0, "a swap on a funded pool was refused");
+    }
+
+    /// @notice On a funded pool no fee is ever deferred: every fee reaches the recipient in its own swap, so
+    /// whatever is pending at any point can only be claims strangers gifted and nobody has collected yet.
+    function invariant_fundedPoolDefersNoFee() public view {
+        assertLe(hook.pendingFees(), handler.ghost_claimsGifted(), "a fee was deferred on a funded pool");
     }
 }
 

@@ -2,13 +2,18 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTestNoChecks} from "v4-core/src/test/PoolModifyLiquidityTestNoChecks.sol";
 
@@ -16,6 +21,7 @@ import {HookFlags} from "../../src/HookFlags.sol";
 import {RNNNImdFeeHook} from "../../src/RNNNImdFeeHook.sol";
 import {RNNNToken} from "../../src/RNNNToken.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
+import {ActualDeltaRouter} from "../mocks/ActualDeltaRouter.sol";
 
 /// @notice Shared scaffolding for the hook's invariant and ordering suites: mines the hook to its flags,
 /// can place the mock IMD on either side of RNNN in the pool key, and wraps v4-core's test routers.
@@ -128,6 +134,61 @@ abstract contract RNNNImdFixture is Test {
         SwapParams memory params = SwapParams(zeroForOne, amountSpecified, priceLimit(zeroForOne));
         vm.prank(actor);
         return router.swap(key, params, PoolSwapTest.TestSettings(false, false), "");
+    }
+
+    /// @dev The same swap through a router that settles the PoolManager's recorded deltas after the swap,
+    /// as the Universal Router does. v4-core's `PoolSwapTest` requires the returned `BalanceDelta` to equal
+    /// the recorded one and so cannot complete a swap the hook refunds inside; this router can. `maxIn` of
+    /// the input currency is handed over up front and whatever the swap does not use comes back.
+    function swapActualAs(
+        ActualDeltaRouter router,
+        PoolKey memory key,
+        address actor,
+        SwapParams memory params,
+        uint256 maxIn
+    ) internal returns (BalanceDelta) {
+        vm.prank(actor);
+        return router.swap(key, params, maxIn);
+    }
+
+    /// @dev Swap parameters whose price limit sits `spacings` tick spacings from the pool's current price,
+    /// so the pool stops filling there: the slippage-protected shape of an order.
+    function limitedParams(
+        PoolManager manager,
+        PoolKey memory key,
+        bool zeroForOne,
+        int256 amountSpecified,
+        int24 spacings
+    ) internal view returns (SwapParams memory) {
+        (, int24 tick,,) = StateLibrary.getSlot0(
+            IPoolManager(address(manager)), PoolId.wrap(keccak256(abi.encode(key)))
+        );
+        int24 target = zeroForOne ? tick - spacings * TICK_SPACING : tick + spacings * TICK_SPACING;
+        if (target < TickMath.MIN_TICK + 1) target = TickMath.MIN_TICK + 1;
+        if (target > TickMath.MAX_TICK - 1) target = TickMath.MAX_TICK - 1;
+        return SwapParams(zeroForOne, amountSpecified, TickMath.getSqrtPriceAtTick(target));
+    }
+
+    /// @dev The fee the hook's `beforeSwap` declares when IMD is the specified currency, computed here
+    /// independently from the README's rule: a full fill of an exact input X trades X - X/101 and owes
+    /// X/101; a full fill of an exact output Y pays out Y + Y/99 and owes Y/99. Clamped to the delta range.
+    function declaredFee(int256 amountSpecified) internal pure returns (uint256 fee) {
+        uint256 amount = amountSpecified < 0 ? uint256(-amountSpecified) : uint256(amountSpecified);
+        fee = amountSpecified < 0 ? amount / 101 : amount / 99;
+        uint256 maxDelta = uint256(uint128(type(int128).max));
+        if (fee > maxDelta) fee = maxDelta;
+    }
+
+    /// @dev How a revert inside `afterSwap` reaches the caller of `PoolManager.unlock`: wrapped by v4-core
+    /// with the hook address, the callback selector and `HookCallFailed`.
+    function wrappedAfterSwapRevert(address hook, bytes4 reason) internal pure returns (bytes memory) {
+        return abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            hook,
+            IHooks.afterSwap.selector,
+            abi.encodeWithSelector(reason),
+            abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+        );
     }
 
     function approveAll(address owner, RNNNToken rnnn, MockERC20 imd, address[] memory spenders) internal {
